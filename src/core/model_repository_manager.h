@@ -27,26 +27,21 @@
 #pragma once
 
 #include <mutex>
-#include "src/core/backend.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/status.h"
-#include "src/servables/caffe2/netdef_bundle.h"
-#include "src/servables/custom/custom_bundle.h"
-#include "src/servables/ensemble/ensemble_bundle.h"
-#include "src/servables/tensorflow/graphdef_bundle.h"
-#include "src/servables/tensorflow/savedmodel_bundle.h"
-#include "src/servables/tensorrt/plan_bundle.h"
+#include "src/core/server_status.pb.h"
 
 namespace tensorflow { namespace serving {
 class ModelConfig;
-class ModelSpec;
 class ServerCore;
-class ServableHandle;
 }}  // namespace tensorflow::serving
 namespace tfs = tensorflow::serving;
 
 namespace nvidia { namespace inferenceserver {
+
+class InferenceBackend;
+class ServerStatusManager;
 
 /// A singleton to manage the model repository active in the server. A
 /// singleton is used because the servables have no connection to the
@@ -63,16 +58,7 @@ class ModelRepositoryManager {
 
   class BackendHandle {
    public:
-    BackendHandle(const Platform& platform, const tfs::ModelSpec& spec, tfs::ServerCore* core);
-    InferenceBackend* GetInferenceBackend() { return is_; }
-   private:
-    InferenceBackend* is_;
-    tfs::ServableHandle<GraphDefBundle> graphdef_bundle_;
-    tfs::ServableHandle<PlanBundle> plan_bundle_;
-    tfs::ServableHandle<NetDefBundle> netdef_bundle_;
-    tfs::ServableHandle<SavedModelBundle> saved_model_bundle_;
-    tfs::ServableHandle<CustomBundle> custom_bundle_;
-    tfs::ServableHandle<EnsembleBundle> ensemble_bundle_;
+    virtual InferenceBackend* GetInferenceBackend() = 0;
   };
 
   /// Create a manager for a repository.
@@ -132,7 +118,7 @@ class ModelRepositoryManager {
   /// \param model_version The model version of the backend handle.
   /// \param handle Return the backend handle object.
   /// \return error status.
-  static Status GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>& handle);
+  static Status GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>* handle);
 
   /// Poll the model repository to determine the new set of models and
   /// compare with the current set. Return the additions, deletions,

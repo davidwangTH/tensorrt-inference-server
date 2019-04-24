@@ -27,14 +27,22 @@
 
 #include "src/core/model_repository_manager.h"
 
+#include "src/core/backend.h"
 #include "src/core/constants.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
+#include "src/core/server_status.h"
+#include "src/servables/caffe2/netdef_bundle.h"
 #include "src/servables/caffe2/netdef_bundle.pb.h"
+#include "src/servables/custom/custom_bundle.h"
 #include "src/servables/custom/custom_bundle.pb.h"
+#include "src/servables/ensemble/ensemble_bundle.h"
 #include "src/servables/ensemble/ensemble_bundle.pb.h"
+#include "src/servables/tensorflow/graphdef_bundle.h"
 #include "src/servables/tensorflow/graphdef_bundle.pb.h"
+#include "src/servables/tensorflow/savedmodel_bundle.h"
 #include "src/servables/tensorflow/savedmodel_bundle.pb.h"
+#include "src/servables/tensorrt/plan_bundle.h"
 #include "src/servables/tensorrt/plan_bundle.pb.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
@@ -252,7 +260,21 @@ IsModified(const std::string& path, int64_t* last_ns)
 
 ModelRepositoryManager* ModelRepositoryManager::singleton = nullptr;
 
-ModelRepositoryManager::BackendHandle::BackendHandle(
+class BackendHandleImpl {
+ public:
+  BackendHandleImpl(const Platform& platform, const tfs::ModelSpec& spec, tfs::ServerCore* core);
+  InferenceBackend* GetInferenceBackend() override { return is_; }
+ private:
+  InferenceBackend* is_;
+  tfs::ServableHandle<GraphDefBundle> graphdef_bundle_;
+  tfs::ServableHandle<PlanBundle> plan_bundle_;
+  tfs::ServableHandle<NetDefBundle> netdef_bundle_;
+  tfs::ServableHandle<SavedModelBundle> saved_model_bundle_;
+  tfs::ServableHandle<CustomBundle> custom_bundle_;
+  tfs::ServableHandle<EnsembleBundle> ensemble_bundle_;
+};
+
+ModelRepositoryManager::BackendHandleImpl::BackendHandleImpl(
   const Platform& platform, const tfs::ModelSpec& spec, tfs::ServerCore* core)
 {
   tensorflow::Status tfstatus;
@@ -571,7 +593,7 @@ ModelRepositoryManager::GetVersionStates(const std::string& model_name)
 }
 
 Status
-ModelRepositoryManager::GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>& handle)
+ModelRepositoryManager::GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>* handle)
 {
   // Create the model-spec. A negative version indicates that the
   // latest version of the model should be used.

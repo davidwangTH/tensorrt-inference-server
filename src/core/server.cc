@@ -135,7 +135,7 @@ InferenceServer::Init()
       repository_poll_secs_);
   if (!status.IsOk()) {
     LOG_ERROR << status.Message();
-    if (singleton == nullptr) {
+    if (ModelRepositoryManager::singleton == nullptr) {
       ready_state_ = ServerReadyState::SERVER_FAILED_TO_INITIALIZE;}
     else {
       ready_state_ = ServerReadyState::SERVER_READY;
@@ -152,7 +152,8 @@ InferenceServer::Stop()
 {
   ready_state_ = ServerReadyState::SERVER_EXITING;
 
-  if (singleton == nullptr) {
+  // [TODO] clean up
+  if (ModelRepositoryManager::singleton == nullptr) {
     LOG_INFO << "No server context available. Exiting immediately.";
     return true;
   } else {
@@ -404,7 +405,7 @@ class InferBackendHandleImpl : public InferenceServer::InferBackendHandle {
 
   InferenceBackend* GetInferenceBackend() override
   {
-    return backend_handle_.InferenceBackend(); 
+    return backend_handle_->GetInferenceBackend(); 
   }
 
  private:
