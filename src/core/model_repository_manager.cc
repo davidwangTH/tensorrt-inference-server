@@ -30,10 +30,20 @@
 #include "src/core/constants.h"
 #include "src/core/logging.h"
 #include "src/core/model_config_utils.h"
+#include "src/servables/caffe2/netdef_bundle.pb.h"
+#include "src/servables/custom/custom_bundle.pb.h"
+#include "src/servables/ensemble/ensemble_bundle.pb.h"
+#include "src/servables/tensorflow/graphdef_bundle.pb.h"
+#include "src/servables/tensorflow/savedmodel_bundle.pb.h"
+#include "src/servables/tensorrt/plan_bundle.pb.h"
 #include "tensorflow/core/lib/io/path.h"
 #include "tensorflow/core/platform/env.h"
 #include "tensorflow/core/platform/file_statistics.h"
 #include "tensorflow_serving/config/model_server_config.pb.h"
+#include "tensorflow_serving/config/platform_config.pb.h"
+#include "tensorflow_serving/core/availability_preserving_policy.h"
+#include "tensorflow_serving/core/servable_handle.h"
+#include "tensorflow_serving/model_servers/server_core.h"
 
 namespace nvidia { namespace inferenceserver {
 
@@ -45,6 +55,137 @@ struct ModelRepositoryManager::ModelInfo {
 };
 
 namespace {
+
+void
+BuildPlatformConfigMap(
+    const std::string& version, const std::string& model_store_path,
+    const bool strict_model_config, const float tf_gpu_memory_fraction,
+    const bool tf_allow_soft_placement, PlatformConfigMap* platform_configs,
+    tfs::PlatformConfigMap* tfs_platform_configs)
+{
+  ::google::protobuf::Any graphdef_source_adapter_config;
+  ::google::protobuf::Any saved_model_source_adapter_config;
+  ::google::protobuf::Any plan_source_adapter_config;
+  ::google::protobuf::Any netdef_source_adapter_config;
+  ::google::protobuf::Any custom_source_adapter_config;
+  ::google::protobuf::Any ensemble_source_adapter_config;
+
+  //// Tensorflow GraphDef
+  {
+    GraphDefBundleSourceAdapterConfig graphdef_config;
+
+    graphdef_config.set_autofill(!strict_model_config);
+
+    // Tensorflow session config
+    if (tf_gpu_memory_fraction == 0.0) {
+      graphdef_config.mutable_session_config()
+          ->mutable_gpu_options()
+          ->set_allow_growth(true);
+    } else {
+      graphdef_config.mutable_session_config()
+          ->mutable_gpu_options()
+          ->set_per_process_gpu_memory_fraction(tf_gpu_memory_fraction);
+    }
+
+    graphdef_config.mutable_session_config()->set_allow_soft_placement(
+        tf_allow_soft_placement);
+    graphdef_source_adapter_config.PackFrom(graphdef_config);
+  }
+
+  //// Tensorflow SavedModel
+  {
+    SavedModelBundleSourceAdapterConfig saved_model_config;
+
+    saved_model_config.set_autofill(!strict_model_config);
+
+    if (tf_gpu_memory_fraction == 0.0) {
+      saved_model_config.mutable_session_config()
+          ->mutable_gpu_options()
+          ->set_allow_growth(true);
+    } else {
+      saved_model_config.mutable_session_config()
+          ->mutable_gpu_options()
+          ->set_per_process_gpu_memory_fraction(tf_gpu_memory_fraction);
+    }
+
+    saved_model_config.mutable_session_config()->set_allow_soft_placement(
+        tf_allow_soft_placement);
+    saved_model_source_adapter_config.PackFrom(saved_model_config);
+  }
+
+  //// Caffe NetDef
+  {
+    NetDefBundleSourceAdapterConfig netdef_config;
+    netdef_config.set_autofill(!strict_model_config);
+    netdef_source_adapter_config.PackFrom(netdef_config);
+  }
+
+  //// TensorRT
+  {
+    PlanBundleSourceAdapterConfig plan_config;
+    plan_config.set_autofill(!strict_model_config);
+    plan_source_adapter_config.PackFrom(plan_config);
+  }
+
+  //// Custom
+  {
+    CustomBundleSourceAdapterConfig custom_config;
+    custom_config.set_inference_server_version(version);
+    custom_config.set_model_repository_path(model_store_path);
+    custom_source_adapter_config.PackFrom(custom_config);
+  }
+
+  //// Ensemble
+  {
+    EnsembleBundleSourceAdapterConfig ensemble_config;
+    ensemble_source_adapter_config.PackFrom(ensemble_config);
+  }
+
+  (*platform_configs)[kTensorFlowGraphDefPlatform] =
+      graphdef_source_adapter_config;
+  (*platform_configs)[kTensorFlowSavedModelPlatform] =
+      saved_model_source_adapter_config;
+  (*platform_configs)[kCaffe2NetDefPlatform] = netdef_source_adapter_config;
+  (*platform_configs)[kTensorRTPlanPlatform] = plan_source_adapter_config;
+  (*platform_configs)[kCustomPlatform] = custom_source_adapter_config;
+  (*platform_configs)[kEnsemblePlatform] = ensemble_source_adapter_config;
+
+  // Must also return the configs in format required by TFS for
+  // ServerCore.
+  (*(*tfs_platform_configs
+          ->mutable_platform_configs())[kTensorFlowGraphDefPlatform]
+        .mutable_source_adapter_config()) = graphdef_source_adapter_config;
+  (*(*tfs_platform_configs
+          ->mutable_platform_configs())[kTensorFlowSavedModelPlatform]
+        .mutable_source_adapter_config()) = saved_model_source_adapter_config;
+  (*(*tfs_platform_configs->mutable_platform_configs())[kCaffe2NetDefPlatform]
+        .mutable_source_adapter_config()) = netdef_source_adapter_config;
+  (*(*tfs_platform_configs->mutable_platform_configs())[kTensorRTPlanPlatform]
+        .mutable_source_adapter_config()) = plan_source_adapter_config;
+  (*(*tfs_platform_configs->mutable_platform_configs())[kCustomPlatform]
+        .mutable_source_adapter_config()) = custom_source_adapter_config;
+  (*(*tfs_platform_configs->mutable_platform_configs())[kEnsemblePlatform]
+        .mutable_source_adapter_config()) = ensemble_source_adapter_config;
+}
+
+ModelReadyState ManagerStateToModelReadyState(tfs::ServableState::ManagerState manager_state)
+{
+  switch (manager_state) {
+    case tfs::ServableState::ManagerState::kLoading:
+      return ModelReadyState::MODEL_LOADING;
+      break;
+    case tfs::ServableState::ManagerState::kUnloading:
+      return ModelReadyState::MODEL_UNLOADING;
+      break;
+    case tfs::ServableState::ManagerState::kAvailable:
+      return ModelReadyState::MODEL_READY;
+      break;
+    default:
+      return ModelReadyState::MODEL_UNAVAILABLE;
+      break;
+  }
+  return ModelReadyState::MODEL_UNKNOWN;
+}
 
 int64_t
 GetModifiedTime(const std::string& path)
@@ -111,18 +252,71 @@ IsModified(const std::string& path, int64_t* last_ns)
 
 ModelRepositoryManager* ModelRepositoryManager::singleton = nullptr;
 
+ModelRepositoryManager::BackendHandle::BackendHandle(
+  const Platform& platform, const tfs::ModelSpec& spec, tfs::ServerCore* core)
+{
+  tensorflow::Status tfstatus;
+  is_ = nullptr;
+
+  switch (platform) {
+    case Platform::PLATFORM_TENSORFLOW_GRAPHDEF:
+      tfstatus = core->GetServableHandle(model_spec, &(graphdef_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(graphdef_bundle_.get());
+      }
+      break;
+    case Platform::PLATFORM_TENSORFLOW_SAVEDMODEL:
+      tfstatus = core->GetServableHandle(model_spec, &(saved_model_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(saved_model_bundle_.get());
+      }
+      break;
+    case Platform::PLATFORM_TENSORRT_PLAN:
+      tfstatus = core->GetServableHandle(model_spec, &(plan_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(plan_bundle_.get());
+      }
+      break;
+    case Platform::PLATFORM_CAFFE2_NETDEF:
+      tfstatus = core->GetServableHandle(model_spec, &(netdef_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(netdef_bundle_.get());
+      }
+      break;
+    case Platform::PLATFORM_CUSTOM:
+      tfstatus = core->GetServableHandle(model_spec, &(custom_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(custom_bundle_.get());
+      }
+      break;
+    case Platform::PLATFORM_ENSEMBLE:
+      tfstatus = core->GetServableHandle(model_spec, &(ensemble_bundle_));
+      if (tfstatus.ok()) {
+        is_ = static_cast<InferenceBackend*>(ensemble_bundle_.get());
+      }
+      break;
+    default:
+      break;
+  }
+}
+
 ModelRepositoryManager::ModelRepositoryManager(
+    const std::shared_ptr<ServerStatusManager>& status_manager,
     const std::string& repository_path,
     const PlatformConfigMap& platform_config_map, const bool autofill)
     : repository_path_(repository_path),
-      platform_config_map_(platform_config_map), autofill_(autofill)
+      platform_config_map_(platform_config_map), autofill_(autofill),
+      status_manager_(status_manager)
 {
 }
 
 Status
 ModelRepositoryManager::Create(
+    const std::string& server_version,
+    const std::shared_ptr<ServerStatusManager>& status_manager,
     const std::string& repository_path,
-    const PlatformConfigMap& platform_config_map, const bool autofill)
+    const bool strict_model_config, const float tf_gpu_memory_fraction,
+    const bool tf_allow_soft_placement, const uint32_t repository_poll_secs)
 {
   if (singleton != nullptr) {
     return Status(
@@ -130,8 +324,67 @@ ModelRepositoryManager::Create(
         "ModelRepositoryManager singleton already created");
   }
 
-  singleton = new ModelRepositoryManager(
-      repository_path, platform_config_map, autofill);
+  // For ServerCore Options, we leave servable_state_monitor_creator unspecified
+  // so the default servable_state_monitor_creator will be used.
+  tfs::ServerCore::Options options;
+
+  // Set some default values in Options
+  options.aspired_version_policy = std::unique_ptr<tfs::AspiredVersionPolicy>(
+      new tfs::AvailabilityPreservingPolicy);
+
+  // If not polling the model repository then set the poll secs to 0
+  // in TFS so that repository is only checked a single time at
+  // startup.
+  options.max_num_load_retries = 0;
+  options.file_system_poll_wait_seconds = repository_poll_secs;
+
+  PlatformConfigMap& platform_config_map;
+  
+  BuildPlatformConfigMap(
+      server_version, repository_path, strict_model_config,
+      tf_gpu_memory_fraction, tf_allow_soft_placement, &platform_config_map,
+      &options.platform_config_map);
+
+  LOG_VERBOSE(1) << options.platform_config_map.DebugString();
+
+  // Not setting the singleton directly because error on TFS core creation
+  // will not cause initialization failure.
+  std::unique_ptr<ModelRepositoryManager> manager(new ModelRepositoryManager(
+      status_manager, repository_path, platform_config_map, !strict_model_config));
+
+  // Similar to PollAndUpdate(), but simplier
+  std::set<std::string> added, deleted, modified, unmodified;
+  RETURN_IF_ERROR(ModelRepositoryManager::Poll(&added, &deleted, &modified, &unmodified));
+  if (!deleted.empty() || !modified.empty() || !unmodified.empty()) {
+    return Status(RequestStatusCode::INTERNAL, "Unexpected initial state for model repository");
+  }
+
+  for (const auto& name : added) {
+    tfs::ModelConfig* tfs_config =
+        options.model_server_config.mutable_model_config_list()->add_config();
+    Status status = ModelRepositoryManager::GetTFSModelConfig(name, tfs_config);
+    if (!status.IsOk()) {
+      return Status(RequestStatusCode::INTERNAL, "Internal: model repository manager inconsistency");
+    }
+
+    // [TODO] fix this (not exposing singleton on create)
+    ModelConfig model_config;
+    RETURN_IF_ERROR(
+        ModelRepositoryManager::GetModelConfig(name, &model_config));
+    status = manager->status_manager_->InitForModel(name, model_config);
+    if (!status.IsOk()) {
+
+      return status;
+    }
+  }
+
+  LOG_VERBOSE(1) << options.model_server_config.DebugString();
+
+  // Create the server core. We assume that any failure is due to a
+  // model not loading correctly so we just continue if not exiting on
+  // error.
+  singleton = manager.release();
+  RETURN_IF_TF_ERROR(tfs::ServerCore::Create(std::move(options), &singleton->core_));
 
   return Status::Success;
 }
@@ -190,6 +443,160 @@ ModelRepositoryManager::GetModelPlatform(
   }
 
   return Status::Success;
+}
+
+Status
+ModelRepositoryManager::PollAndUpdate()
+{
+  std::set<std::string> added, deleted, modified, unmodified;
+  RETURN_IF_ERROR(ModelRepositoryManager::Poll(&added, &deleted, &modified, &unmodified));
+  // Nothing to do if no model adds, deletes or modifies.
+  if (added.empty() && deleted.empty() && modified.empty()) {
+    return Status::Success;
+  }
+
+  // [TODO] Once the model repository manager is improved,
+  // model load / unload should be done in separate thread
+
+  // There was a change in the model repository so need to
+  // create a new TFS model configuration and reload it into the
+  // server to cause the appropriate models to be loaded and
+  // unloaded.
+  
+  tfs::ModelServerConfig msc;
+  msc.mutable_model_config_list();
+
+  // Added models should be loaded and be initialized for status
+  // reporting.
+  for (const auto& name : added) {
+    tfs::ModelConfig* tfs_config =
+        msc.mutable_model_config_list()->add_config();
+    RETURN_IF_ERROR(
+        ModelRepositoryManager::GetTFSModelConfig(name, tfs_config));
+    ModelConfig model_config;
+    RETURN_IF_ERROR(
+        ModelRepositoryManager::GetModelConfig(name, &model_config));
+    RETURN_IF_ERROR(singleton->status_manager_->InitForModel(name));
+  }
+
+  // Keep unmodified models...
+  for (const auto& name : unmodified) {
+    tfs::ModelConfig* tfs_config =
+        msc.mutable_model_config_list()->add_config();
+    RETURN_IF_ERROR(
+        ModelRepositoryManager::GetTFSModelConfig(name, tfs_config));
+  }
+
+  RETURN_IF_TF_ERROR(singleton->core_->ReloadConfig(msc));
+
+  // If there are any modified model, (re)load them to pick up
+  // the changes. We want to keep the current status information
+  // so don't re-init it.
+  if (!modified.empty()) {
+    for (const auto& name : modified) {
+      tfs::ModelConfig* tfs_config =
+          msc.mutable_model_config_list()->add_config();
+      RETURN_IF_ERROR(
+          ModelRepositoryManager::GetTFSModelConfig(name, tfs_config));
+      ModelConfig model_config;
+      RETURN_IF_ERROR(
+          ModelRepositoryManager::GetModelConfig(name, &model_config));
+      RETURN_IF_ERROR(singleton->status_manager_->UpdateConfigForModel(name, model_config));
+    }
+
+    RETURN_IF_TF_ERROR(singleton->core_->ReloadConfig(msc));
+  }
+}
+
+Status
+ModelRepositoryManager::LoadUnloadModel(
+    const std::string& model_name, ActionType type,
+    std::function<void(Status)> OnCompleteUpdate)
+{
+  // [TODO] model load / unload should be done in separate thread
+  Status status = Status(RequestStatusCode::UNSUPPORTED, "Not implemented").
+  OnCompleteUpdate(status);
+  return status;
+}
+
+Status
+ModelRepositoryManager::UnloadAllModels()
+{
+  // Reload an empty configuration to cause all models to unload.
+  tfs::ModelServerConfig msc;
+  msc.mutable_model_config_list();
+  tensorflow::Status tfstatus = singleton->core_->ReloadConfig(msc);
+  if (!tfstatus.ok()) {
+    return Status(RequestStatusCode::INTERNAL, "Failed to gracefully unload models: " + tfstatus.error_message());
+  }
+  return Status::Success;
+}
+
+const ModelMap
+ModelRepositoryManager::GetLiveBackendStates()
+{
+  // [TODO] maintain its own ModelMap
+  ModelMap res;
+  const tfs::ServableStateMonitor& monitor = *(singleton->core_->servable_state_monitor());
+  const auto& live_models = monitor.GetLiveServableStates();
+  for (const auto& m : live_models) {
+    VersionStateMap map;
+    for (const auto& v : m.second) {
+      map[v.first] = ManagerStateToModelReadyState(v.second.state().manager_state());
+    }
+    res[m.first] = map;
+  }
+  return res;
+}
+
+const VersionStateMap
+ModelRepositoryManager::GetVersionStates(const std::string& model_name)
+{
+  VersionStateMap res;
+  const tfs::ServableStateMonitor& monitor = *(singleton->core_->servable_state_monitor());
+  const tensorflow::serving::ServableStateMonitor::VersionMap
+      versions_and_states = monitor.GetVersionStates(model_name);
+  for (const auto& version_and_state : versions_and_states) {
+    const int64_t version = version_and_state.first;
+    const tensorflow::serving::ServableState& servable_state =
+        version_and_state.second.state;
+
+    ModelReadyState ready_state = ManagerStateToModelReadyState(servable_state.manager_state);
+
+    if (ready_state != ModelReadyState::MODEL_UNKNOWN) {
+      res[version] = ready_state;
+    }
+  }
+  return res;
+}
+
+Status
+ModelRepositoryManager::GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>& handle)
+{
+  // Create the model-spec. A negative version indicates that the
+  // latest version of the model should be used.
+  tfs::ModelSpec model_spec;
+  model_spec.set_name(model_name);
+  if (model_version >= 0) {
+    model_spec.mutable_version()->set_value(model_version);
+  }
+
+  // Get the InferenceBackend appropriate for the request.
+  Platform platform;
+  Status status =
+      ModelRepositoryManager::GetModelPlatform(model_name, &platform);
+  if (status.IsOk()) {
+    handle->reset(new BackendHandle(platform, model_spec, singleton->core_.get()));
+
+    if ((*handle)->GetInferenceBackend() == nullptr) {
+      handle->reset();
+      status = Status(
+          RequestStatusCode::UNAVAILABLE,
+          "Inference request for unknown model '" + model_name + "'");
+    }
+  }
+
+  return status;
 }
 
 Status

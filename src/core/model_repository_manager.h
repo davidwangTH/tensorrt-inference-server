@@ -27,12 +27,22 @@
 #pragma once
 
 #include <mutex>
+#include "src/core/backend.h"
 #include "src/core/model_config.h"
 #include "src/core/model_config.pb.h"
 #include "src/core/status.h"
+#include "src/servables/caffe2/netdef_bundle.h"
+#include "src/servables/custom/custom_bundle.h"
+#include "src/servables/ensemble/ensemble_bundle.h"
+#include "src/servables/tensorflow/graphdef_bundle.h"
+#include "src/servables/tensorflow/savedmodel_bundle.h"
+#include "src/servables/tensorrt/plan_bundle.h"
 
 namespace tensorflow { namespace serving {
 class ModelConfig;
+class ModelSpec;
+class ServerCore;
+class ServableHandle;
 }}  // namespace tensorflow::serving
 namespace tfs = tensorflow::serving;
 
@@ -43,16 +53,86 @@ namespace nvidia { namespace inferenceserver {
 /// server itself but they need to have access to the configuration.
 class ModelRepositoryManager {
  public:
+  using VersionStateMap = std::map<int64_t, ModelReadyState>;
+  using ModelMap = std::map<std::string, VersionStateMap>;
+
+  enum ActionType {
+    LOAD,
+    UNLOAD
+  };
+
+  class BackendHandle {
+   public:
+    BackendHandle(const Platform& platform, const tfs::ModelSpec& spec, tfs::ServerCore* core);
+    InferenceBackend* GetInferenceBackend() { return is_; }
+   private:
+    InferenceBackend* is_;
+    tfs::ServableHandle<GraphDefBundle> graphdef_bundle_;
+    tfs::ServableHandle<PlanBundle> plan_bundle_;
+    tfs::ServableHandle<NetDefBundle> netdef_bundle_;
+    tfs::ServableHandle<SavedModelBundle> saved_model_bundle_;
+    tfs::ServableHandle<CustomBundle> custom_bundle_;
+    tfs::ServableHandle<EnsembleBundle> ensemble_bundle_;
+  };
+
   /// Create a manager for a repository.
+  /// \param server_version The version of the inference server.
+  /// \param status_manager The status manager that the model repository manager
+  /// will update model configuration and state to.
   /// \param repositpory_path The file-system path of the repository.
-  /// \param platform_config_map Map from platform name to the backend
-  /// configuration for that platform.
-  /// \param autofill If true attempt to autofill missing required
+  /// \param strict_model_config If false attempt to autofill missing required
   /// information in each model configuration.
+  /// \param tf_gpu_memory_fraction The portion of GPU memory to be reserved
+  /// for TensorFlow models.
+  /// \param tf_allow_soft_placement If true instruct TensorFlow to use CPU
+  /// implementation of an operation when a GPU implementation is not available
+  /// \param repository_poll_secs Interval in seconds between each poll of
+  /// the model repository to check for changes. [TODO] will be removed once
+  /// ModelRepositoryManager is improved
   /// \return The error status.
   static Status Create(
+      const std::string& server_version,
+      const std::shared_ptr<ServerStatusManager>& status_manager,
       const std::string& repository_path,
-      const PlatformConfigMap& platform_config_map, const bool autofill);
+      const bool strict_model_config, const float tf_gpu_memory_fraction,
+      const bool tf_allow_soft_placement, const uint32_t repository_poll_secs);
+
+  /// Poll the model repository to determine the new set of models and
+  /// compare with the current set. And serve the new set of models based
+  /// on their version policy.
+  static Status PollAndUpdate();
+
+  /// Load or unload a specified model.
+  /// \parm model_name The name of the model to be loaded or unloaded
+  /// \parm type The type action to be performed. If the action is LOAD and
+  /// the model has been loaded, the model will be re-loaded.
+  /// \param OnCompleteUpdate The callback function to be invoked once the
+  /// action is completed.
+  /// \return error status. Return "NOT_FOUND" if it tries to load
+  /// a non-existing model or if it tries to unload a model that hasn't been
+  /// loaded.
+  static Status LoadUnloadModel(
+      const std::string& model_name, ActionType type,
+      std::function<void(Status)> OnCompleteUpdate);
+
+  /// Unload all models.
+  static Status UnloadAllModels();
+
+  /// \param live_only only return the models that are live, at least one
+  /// model version is available.
+  /// \return the states of all versions of all model backends.
+  static const ModelMap GetLiveBackendStates();
+
+  /// \param model_name The model to get version states from.
+  /// \return the states of all versions of the specified model backends.
+  static const VersionStateMap GetVersionStates(const std::string& model_name);
+
+  /// Obtain the specified backend handle.
+  /// \param model_name The model name of the backend handle.
+  /// \param model_version The model version of the backend handle.
+  /// \param handle Return the backend handle object.
+  /// \return error status.
+  static Status GetBackendHandle(const std::string& model_name, const int64_t model_version, std::unique_ptr<BackendHandle>& handle);
 
   /// Poll the model repository to determine the new set of models and
   /// compare with the current set. Return the additions, deletions,
@@ -96,6 +176,7 @@ class ModelRepositoryManager {
       std::unordered_map<std::string, std::unique_ptr<ModelInfo>>;
 
   ModelRepositoryManager(
+      const std::shared_ptr<ServerStatusManager>& status_manager, 
       const std::string& repository_path,
       const PlatformConfigMap& platform_config_map, const bool autofill);
   ~ModelRepositoryManager() = default;
@@ -109,6 +190,9 @@ class ModelRepositoryManager {
   std::mutex poll_mu_;
   std::mutex infos_mu_;
   ModelInfoMap infos_;
+
+  std::unique_ptr<tensorflow::serving::ServerCore> core_;
+  std::shared_ptr<ServerStatusManager> status_manager_;
 };
 
 }}  // namespace nvidia::inferenceserver

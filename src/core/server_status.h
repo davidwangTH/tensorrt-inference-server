@@ -179,10 +179,10 @@ class ServerStatusManager {
   explicit ServerStatusManager(const std::string& server_version);
 
   // Initialize status for a model.
-  Status InitForModel(const std::string& model_name);
+  Status InitForModel(const std::string& model_name, const ModelConfig& model_config);
 
   // Update model config for an existing model.
-  Status UpdateConfigForModel(const std::string& model_name);
+  Status UpdateConfigForModel(const std::string& model_name, const ModelConfig& model_config);
 
   // Get the entire server status, including status for all models.
   Status Get(
